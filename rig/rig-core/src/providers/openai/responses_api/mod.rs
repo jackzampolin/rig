@@ -1024,6 +1024,9 @@ pub struct AdditionalParameters {
     /// The username of the user (that you want to use).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// A stable identifier used to group requests for prompt caching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
     /// Any additional metadata you'd like to add. This will additionally be returned by the response.
     #[serde(skip_serializing_if = "Map::is_empty", default)]
     pub metadata: serde_json::Map<String, serde_json::Value>,
@@ -1823,5 +1826,45 @@ impl FromStr for UserContent {
         Ok(UserContent::InputText {
             text: s.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompletionRequest;
+    use crate::{OneOrMany, completion};
+    use serde_json::json;
+
+    fn serialize_request(additional_params: Option<serde_json::Value>) -> serde_json::Value {
+        let request = completion::CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::one(completion::Message::from("hello")),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params,
+            output_schema: None,
+        };
+
+        let request = CompletionRequest::try_from(("gpt-4o".to_string(), request))
+            .expect("completion request should convert");
+        serde_json::to_value(request).expect("Responses request should serialize")
+    }
+
+    #[test]
+    fn prompt_cache_key_survives_completion_request_serialization() {
+        let serialized = serialize_request(Some(json!({"prompt_cache_key": "stable-session"})));
+
+        assert_eq!(serialized["prompt_cache_key"], "stable-session");
+    }
+
+    #[test]
+    fn prompt_cache_key_is_omitted_when_not_configured() {
+        let serialized = serialize_request(None);
+
+        assert!(serialized.get("prompt_cache_key").is_none());
     }
 }
