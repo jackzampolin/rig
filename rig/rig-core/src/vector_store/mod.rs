@@ -10,8 +10,8 @@
 //!
 //! Types implementing [`VectorStoreIndex`] automatically implement [`Tool`].
 
-pub use request::VectorSearchRequest;
 use http::StatusCode;
+pub use request::VectorSearchRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
