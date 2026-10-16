@@ -88,6 +88,7 @@ pub struct ResponseChunk {
     #[serde(rename = "type")]
     pub kind: ResponseChunkKind,
     /// The response itself
+    #[serde(deserialize_with = "deserialize_streaming_response")]
     pub response: CompletionResponse,
     /// The item sequence
     pub sequence_number: u64,
@@ -107,6 +108,63 @@ pub enum ResponseChunkKind {
     ResponseFailed,
     #[serde(rename = "response.incomplete")]
     ResponseIncomplete,
+}
+
+/// Streamed function arguments may stop inside JSON. Preserve the raw string
+/// until the tool consumer validates it, without losing the terminal envelope.
+fn retain_unparsed_arguments(item: &mut serde_json::Value) -> serde_json::Result<()> {
+    if item.get("type").and_then(serde_json::Value::as_str) == Some("function_call") {
+        if let Some(serde_json::Value::String(arguments)) = item.get_mut("arguments") {
+            if !arguments.trim().is_empty()
+                && serde_json::from_str::<serde_json::Value>(arguments).is_err()
+            {
+                *arguments = serde_json::to_string(arguments)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn deserialize_streaming_output<'de, D>(deserializer: D) -> Result<Output, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut value = serde_json::Value::deserialize(deserializer)?;
+    retain_unparsed_arguments(&mut value).map_err(serde::de::Error::custom)?;
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_streaming_response<'de, D>(deserializer: D) -> Result<CompletionResponse, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(output) = value
+        .get_mut("output")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in output {
+            retain_unparsed_arguments(item).map_err(serde::de::Error::custom)?;
+        }
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+fn streamed_function_call(
+    function: &super::OutputFunctionCall,
+    identities: &mut std::collections::HashMap<String, String>,
+) -> streaming::RawStreamingToolCall {
+    let internal_id = identities
+        .entry(function.id.clone())
+        .or_insert_with(|| nanoid::nanoid!())
+        .clone();
+    streaming::RawStreamingToolCall::new(
+        function.id.clone(),
+        function.name.clone(),
+        function.arguments.clone(),
+    )
+    .with_internal_call_id(internal_id)
+    .with_call_id(function.call_id.clone())
 }
 
 fn response_error_message(error: Option<&super::ResponseError>, fallback: &str) -> String {
@@ -204,6 +262,7 @@ pub enum ItemChunkKind {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StreamingItemDoneOutput {
     pub sequence_number: u64,
+    #[serde(deserialize_with = "deserialize_streaming_output")]
     pub item: Output,
 }
 
@@ -333,7 +392,7 @@ where
         let stream = stream! {
             let mut final_usage = ResponsesUsage::new();
 
-            let mut tool_calls: Vec<RawStreamingChoice<StreamingCompletionResponse>> = Vec::new();
+            let mut tool_calls: Vec<streaming::RawStreamingToolCall> = Vec::new();
             let mut tool_call_internal_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             let span = tracing::Span::current();
 
@@ -376,18 +435,7 @@ where
                                 ItemChunkKind::OutputItemDone(message) => {
                                     match message {
                                         StreamingItemDoneOutput {  item: Output::FunctionCall(func), .. } => {
-                                            let internal_id = tool_call_internal_ids
-                                                .entry(func.id.clone())
-                                                .or_insert_with(|| nanoid::nanoid!())
-                                                .clone();
-                                            let raw_tool_call = streaming::RawStreamingToolCall::new(
-                                                func.id.clone(),
-                                                func.name.clone(),
-                                                func.arguments.clone(),
-                                            )
-                                                .with_internal_call_id(internal_id)
-                                                .with_call_id(func.call_id.clone());
-                                            tool_calls.push(streaming::RawStreamingChoice::ToolCall(raw_tool_call));
+                                            tool_calls.push(streamed_function_call(func, &mut tool_call_internal_ids));
                                         }
 
                                         StreamingItemDoneOutput {  item: Output::Reasoning {  summary, id, encrypted_content, .. }, .. } => {
@@ -448,6 +496,23 @@ where
                                         final_usage = usage;
                                     }
                                 }
+                                ResponseChunkKind::ResponseIncomplete
+                                    if response.incomplete_details.as_ref()
+                                        .is_some_and(|details| details.reason == "max_output_tokens") => {
+                                    span.record("gen_ai.response.id", response.id.as_str());
+                                    span.record("gen_ai.response.model", response.model.as_str());
+                                    if let Some(usage) = response.usage {
+                                        final_usage = usage;
+                                    }
+                                    for output in &response.output {
+                                        if let Output::FunctionCall(function) = output {
+                                            if !tool_calls.iter().any(|call| call.id == function.id) {
+                                                tool_calls.push(streamed_function_call(function, &mut tool_call_internal_ids));
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
                                 ResponseChunkKind::ResponseFailed | ResponseChunkKind::ResponseIncomplete => {
                                     let error_message = response_chunk_error_message(&kind, &response)
                                         .expect("terminal response should have an error message");
@@ -472,8 +537,8 @@ where
             // Ensure event source is closed when stream ends
             event_source.close();
 
-            for tool_call in &tool_calls {
-                yield Ok(tool_call.to_owned())
+            for tool_call in tool_calls {
+                yield Ok(RawStreamingChoice::ToolCall(tool_call))
             }
 
             span.record("gen_ai.usage.input_tokens", final_usage.input_tokens);
@@ -501,13 +566,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemChunkKind, StreamingCompletionChunk, reasoning_choices_from_done_item};
+    use super::{
+        ItemChunkKind, ResponseChunk, StreamingCompletionChunk, reasoning_choices_from_done_item,
+    };
     use crate::completion::CompletionModel;
     use crate::http_client::mock::MockStreamingClient;
     use crate::message::ReasoningContent;
     use crate::providers::openai::responses_api::{
-        AdditionalParameters, CompletionResponse, IncompleteDetailsReason, OutputTokensDetails,
-        ReasoningSummary, ResponseError, ResponseObject, ResponseStatus, ResponsesUsage,
+        AdditionalParameters, CompletionResponse, IncompleteDetailsReason, Output,
+        OutputTokensDetails, ReasoningSummary, ResponseError, ResponseObject, ResponseStatus,
+        ResponsesUsage,
     };
     use crate::streaming::{RawStreamingChoice, StreamedAssistantContent};
     use bytes::Bytes;
@@ -850,24 +918,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_incomplete_chunk_uses_incomplete_details_reason() {
-        let mut response = sample_response(ResponseStatus::Incomplete);
-        response.incomplete_details = Some(IncompleteDetailsReason {
-            reason: "max_output_tokens".to_string(),
-        });
+    async fn response_incomplete_without_token_limit_remains_an_error() {
+        for reason in [
+            None,
+            Some("content_filter"),
+            Some("max_messages"),
+            Some("steered"),
+            Some("unknown"),
+        ] {
+            let mut response = sample_response(ResponseStatus::Incomplete);
+            response.incomplete_details = reason.map(|reason| IncompleteDetailsReason {
+                reason: reason.into(),
+            });
+            let event =
+                json!({"type":"response.incomplete", "sequence_number":1, "response":response});
+            let err = first_error_from_event(event).await;
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "ProviderError: OpenAI response stream was incomplete: {}",
+                    reason.unwrap_or("unknown reason")
+                )
+            );
+        }
+    }
 
-        let event = json!({
-            "type": "response.incomplete",
-            "sequence_number": 1,
-            "response": response,
-        });
+    #[tokio::test]
+    async fn response_incomplete_token_limit_preserves_tool_arguments_and_usage() {
+        for (arguments, expected) in [
+            (r#"{"text":"ok"}"#, json!({"text":"ok"})),
+            (r#"{"text":"unfinished"#, json!(r#"{"text":"unfinished"#)),
+        ] {
+            for item_done in [false, true] {
+                let call = json!({"type":"function_call", "id":"fc_1", "call_id":"call_1",
+                    "name":"echo", "arguments":arguments, "status":"incomplete"});
+                let mut response =
+                    serde_json::to_value(sample_response(ResponseStatus::Incomplete)).unwrap();
+                response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+                response["output"] = json!([call]);
+                response["usage"] = json!({"input_tokens":10,"output_tokens":5,"total_tokens":15,
+                    "input_tokens_details":{"cached_tokens":2}, "output_tokens_details":{"reasoning_tokens":1}});
+                let mut payload = String::new();
+                if item_done {
+                    payload.push_str(&format!(
+                        "data: {}\n\n",
+                        json!({"type":"response.output_item.done",
+                        "output_index":0,"sequence_number":1,"item":call})
+                    ));
+                }
+                payload.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.incomplete",
+                    "sequence_number":2,"response":response})
+                ));
+                let client = openai::Client::builder()
+                    .http_client(MockStreamingClient {
+                        sse_bytes: Bytes::from(payload),
+                    })
+                    .api_key("test-key")
+                    .build()
+                    .unwrap();
+                let model = client.completion_model("gpt-test");
+                let mut stream = model
+                    .stream(model.completion_request("hello").build())
+                    .await
+                    .unwrap();
+                let mut calls = Vec::new();
+                let mut usage = None;
+                while let Some(item) = stream.next().await {
+                    match item.expect("a token-limit stop is an explicit terminal response") {
+                        StreamedAssistantContent::ToolCall { tool_call, .. } => {
+                            calls.push(tool_call)
+                        }
+                        StreamedAssistantContent::Final(response) => usage = Some(response.usage),
+                        _ => {}
+                    }
+                }
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "item_done={item_done}, arguments={arguments}"
+                );
+                assert_eq!(calls[0].call_id.as_deref(), Some("call_1"));
+                assert_eq!(calls[0].function.name, "echo");
+                assert_eq!(calls[0].function.arguments, expected);
+                let usage = usage.expect("terminal usage must survive a token-limit stop");
+                assert_eq!(usage.input_tokens, 10);
+                assert_eq!(usage.output_tokens, 5);
+                assert_eq!(usage.total_tokens, 15);
+                assert_eq!(usage.input_tokens_details.unwrap().cached_tokens, 2);
+                assert_eq!(usage.output_tokens_details.reasoning_tokens, 1);
+            }
+        }
+    }
 
-        let err = first_error_from_event(event).await;
-
-        assert_eq!(
-            err.to_string(),
-            "ProviderError: OpenAI response stream was incomplete: max_output_tokens"
-        );
+    #[test]
+    fn partial_arguments_are_preserved_only_by_streaming_decoders() {
+        let arguments = r#"{"text":"unfinished"#;
+        let mut response =
+            serde_json::to_value(sample_response(ResponseStatus::Incomplete)).unwrap();
+        response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+        response["output"] = json!([{"type":"function_call", "id":"fc_1",
+            "call_id":"call_1", "name":"echo", "arguments":arguments,
+            "status":"incomplete"}]);
+        assert!(serde_json::from_value::<CompletionResponse>(response.clone()).is_err());
+        let chunk: ResponseChunk = serde_json::from_value(json!({
+            "type":"response.incomplete", "sequence_number":1, "response":response
+        }))
+        .unwrap();
+        let Output::FunctionCall(function) = &chunk.response.output[0] else {
+            panic!("expected a function call");
+        };
+        assert_eq!(function.arguments, json!(arguments));
     }
 
     #[tokio::test]
