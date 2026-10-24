@@ -108,7 +108,9 @@ pub trait ModelListingClient {
 ///     }
 /// }
 /// ```
-pub trait ModelLister<H = crate::client::DefaultHttpClient>: WasmCompatSend + WasmCompatSync {
+pub trait ModelLister<H = crate::client::DefaultHttpClient>:
+    WasmCompatSend + WasmCompatSync
+{
     /// The client type associated with this lister
     type Client;
 

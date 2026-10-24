@@ -715,9 +715,16 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             .as_ref()
             .map(|usage| completion::Usage {
                 input_tokens: usage.prompt_tokens as u64,
-                output_tokens: (usage.total_tokens - usage.prompt_tokens) as u64,
+                output_tokens: usage
+                    .completion_tokens
+                    .unwrap_or_else(|| usage.total_tokens.saturating_sub(usage.prompt_tokens))
+                    as u64,
                 total_tokens: usage.total_tokens as u64,
-                cached_input_tokens: 0,
+                cached_input_tokens: usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens)
+                    .unwrap_or_default() as u64,
                 cache_creation_input_tokens: 0,
             })
             .unwrap_or_default();
