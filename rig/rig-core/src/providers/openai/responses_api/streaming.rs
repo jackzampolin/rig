@@ -36,8 +36,9 @@ pub enum StreamingCompletionChunk {
 /// The final streaming response from the OpenAI Responses API.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StreamingCompletionResponse {
-    /// Token usage
-    pub usage: ResponsesUsage,
+    /// Final provider usage, absent when no terminal event reported it.
+    #[serde(default)]
+    pub usage: Option<ResponsesUsage>,
 }
 
 pub(crate) fn reasoning_choices_from_done_item(
@@ -67,17 +68,18 @@ pub(crate) fn reasoning_choices_from_done_item(
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> Option<crate::completion::Usage> {
-        let mut usage = crate::completion::Usage::new();
-        usage.input_tokens = self.usage.input_tokens;
-        usage.output_tokens = self.usage.output_tokens;
-        usage.total_tokens = self.usage.total_tokens;
-        usage.cached_input_tokens = self
-            .usage
-            .input_tokens_details
-            .as_ref()
-            .map(|d| d.cached_tokens)
-            .unwrap_or(0);
-        Some(usage)
+        let reported = self.usage.as_ref()?;
+        Some(crate::completion::Usage {
+            input_tokens: reported.input_tokens,
+            output_tokens: reported.output_tokens,
+            total_tokens: reported.total_tokens,
+            cached_input_tokens: reported
+                .input_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0),
+            cache_creation_input_tokens: 0,
+        })
     }
 }
 
@@ -390,7 +392,7 @@ where
         let mut event_source = GenericEventSource::new(client, req);
 
         let stream = stream! {
-            let mut final_usage = ResponsesUsage::new();
+            let mut final_usage = None;
 
             let mut tool_calls: Vec<streaming::RawStreamingToolCall> = Vec::new();
             let mut tool_call_internal_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -493,7 +495,7 @@ where
                                     span.record("gen_ai.response.id", response.id.as_str());
                                     span.record("gen_ai.response.model", response.model.as_str());
                                     if let Some(usage) = response.usage {
-                                        final_usage = usage;
+                                        final_usage = Some(usage);
                                     }
                                 }
                                 ResponseChunkKind::ResponseIncomplete
@@ -502,7 +504,7 @@ where
                                     span.record("gen_ai.response.id", response.id.as_str());
                                     span.record("gen_ai.response.model", response.model.as_str());
                                     if let Some(usage) = response.usage {
-                                        final_usage = usage;
+                                        final_usage = Some(usage);
                                     }
                                     for output in &response.output {
                                         if let Output::FunctionCall(function) = output {
@@ -541,16 +543,13 @@ where
                 yield Ok(RawStreamingChoice::ToolCall(tool_call))
             }
 
-            span.record("gen_ai.usage.input_tokens", final_usage.input_tokens);
-            span.record("gen_ai.usage.output_tokens", final_usage.output_tokens);
-            span.record(
-                "gen_ai.usage.cached_tokens",
-                final_usage
-                    .input_tokens_details
-                    .as_ref()
-                    .map(|d| d.cached_tokens)
-                    .unwrap_or(0),
-            );
+            if let Some(usage) = &final_usage {
+                span.record("gen_ai.usage.input_tokens", usage.input_tokens);
+                span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+                if let Some(cached) = usage.input_tokens_details.as_ref().and_then(|d| d.cached_tokens) {
+                    span.record("gen_ai.usage.cached_tokens", cached);
+                }
+            }
             tracing::info!("OpenAI stream finished");
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
@@ -653,7 +652,7 @@ mod tests {
             .expect_err("stream should surface a provider error")
     }
 
-    async fn final_usage_from_event(event: serde_json::Value) -> ResponsesUsage {
+    async fn final_usage_from_event(event: serde_json::Value) -> Option<ResponsesUsage> {
         let client = openai::Client::builder()
             .http_client(MockStreamingClient {
                 sse_bytes: sse_event_bytes(event),
@@ -990,7 +989,7 @@ mod tests {
                         StreamedAssistantContent::ToolCall { tool_call, .. } => {
                             calls.push(tool_call)
                         }
-                        StreamedAssistantContent::Final(response) => usage = Some(response.usage),
+                        StreamedAssistantContent::Final(response) => usage = response.usage,
                         _ => {}
                     }
                 }
@@ -1006,8 +1005,11 @@ mod tests {
                 assert_eq!(usage.input_tokens, 10);
                 assert_eq!(usage.output_tokens, 5);
                 assert_eq!(usage.total_tokens, 15);
-                assert_eq!(usage.input_tokens_details.unwrap().cached_tokens, 2);
-                assert_eq!(usage.output_tokens_details.reasoning_tokens, 1);
+                assert_eq!(usage.input_tokens_details.unwrap().cached_tokens, Some(2));
+                assert_eq!(
+                    usage.output_tokens_details.unwrap().reasoning_tokens,
+                    Some(1)
+                );
             }
         }
     }
@@ -1033,15 +1035,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_usage_stays_absent_on_completed_and_unfinished_streams() {
+        for kind in ["response.completed", "response.created"] {
+            let event = json!({
+                "type": kind,
+                "sequence_number": 1,
+                "response": sample_response(ResponseStatus::Completed),
+            });
+            assert!(final_usage_from_event(event).await.is_none(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn missing_usage_breakdowns_remain_distinct_from_zero() {
+        use super::StreamingCompletionResponse;
+        use crate::completion::GetTokenUsage;
+        for details in [
+            json!({}),
+            json!({"input_tokens_details":{}, "output_tokens_details":{}}),
+        ] {
+            let mut raw = json!({"input_tokens":10, "output_tokens":5, "total_tokens":15});
+            raw.as_object_mut()
+                .unwrap()
+                .extend(details.as_object().unwrap().clone());
+            let response: StreamingCompletionResponse =
+                serde_json::from_value(json!({"usage":raw})).unwrap();
+            let usage = response.usage.as_ref().unwrap();
+            assert_eq!(
+                usage
+                    .input_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens),
+                None
+            );
+            assert_eq!(
+                usage
+                    .output_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.reasoning_tokens),
+                None
+            );
+            assert_eq!(response.token_usage().unwrap().total_tokens, 15);
+        }
+        let absent: StreamingCompletionResponse = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.token_usage().is_none());
+    }
+
+    #[tokio::test]
     async fn response_completed_chunk_populates_final_usage() {
         let mut response = sample_response(ResponseStatus::Completed);
         response.usage = Some(ResponsesUsage {
             input_tokens: 10,
             input_tokens_details: None,
             output_tokens: 5,
-            output_tokens_details: OutputTokensDetails {
-                reasoning_tokens: 0,
-            },
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: Some(0),
+            }),
             total_tokens: 15,
         });
 
@@ -1051,7 +1100,7 @@ mod tests {
             "response": response,
         });
 
-        let usage = final_usage_from_event(event).await;
+        let usage = final_usage_from_event(event).await.expect("reported usage");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.total_tokens, 15);

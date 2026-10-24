@@ -153,7 +153,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 cached_input_tokens: u
                     .input_tokens_details
                     .clone()
-                    .map(|x| x.cached_tokens)
+                    .and_then(|x| x.cached_tokens)
                     .unwrap_or_default(),
                 cache_creation_input_tokens: 0,
             })

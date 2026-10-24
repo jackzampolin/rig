@@ -630,22 +630,10 @@ pub struct ResponsesUsage {
     /// Output tokens
     pub output_tokens: u64,
     /// In-depth detail on output tokens (reasoning tokens)
-    pub output_tokens_details: OutputTokensDetails,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<OutputTokensDetails>,
     /// Total tokens used (for a given prompt)
     pub total_tokens: u64,
-}
-
-impl ResponsesUsage {
-    /// Create a new ResponsesUsage instance
-    pub(crate) fn new() -> Self {
-        Self {
-            input_tokens: 0,
-            input_tokens_details: Some(InputTokensDetails::new()),
-            output_tokens: 0,
-            output_tokens_details: OutputTokensDetails::new(),
-            total_tokens: 0,
-        }
-    }
 }
 
 impl Add for ResponsesUsage {
@@ -653,15 +641,15 @@ impl Add for ResponsesUsage {
 
     fn add(self, rhs: Self) -> Self::Output {
         let input_tokens = self.input_tokens + rhs.input_tokens;
-        let input_tokens_details = self.input_tokens_details.map(|lhs| {
-            if let Some(tokens) = rhs.input_tokens_details {
-                lhs + tokens
-            } else {
-                lhs
-            }
-        });
+        let input_tokens_details = self
+            .input_tokens_details
+            .zip(rhs.input_tokens_details)
+            .map(|(lhs, rhs)| lhs + rhs);
         let output_tokens = self.output_tokens + rhs.output_tokens;
-        let output_tokens_details = self.output_tokens_details + rhs.output_tokens_details;
+        let output_tokens_details = self
+            .output_tokens_details
+            .zip(rhs.output_tokens_details)
+            .map(|(lhs, rhs)| lhs + rhs);
         let total_tokens = self.total_tokens + rhs.total_tokens;
         Self {
             input_tokens,
@@ -676,21 +664,18 @@ impl Add for ResponsesUsage {
 /// In-depth details on input tokens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InputTokensDetails {
-    /// Cached tokens from OpenAI
-    pub cached_tokens: u64,
-}
-
-impl InputTokensDetails {
-    pub(crate) fn new() -> Self {
-        Self { cached_tokens: 0 }
-    }
+    /// Cached tokens if reported; absence is distinct from zero.
+    pub cached_tokens: Option<u64>,
 }
 
 impl Add for InputTokensDetails {
     type Output = Self;
     fn add(self, rhs: Self) -> Self::Output {
         Self {
-            cached_tokens: self.cached_tokens + rhs.cached_tokens,
+            cached_tokens: self
+                .cached_tokens
+                .zip(rhs.cached_tokens)
+                .map(|(lhs, rhs)| lhs + rhs),
         }
     }
 }
@@ -698,23 +683,18 @@ impl Add for InputTokensDetails {
 /// In-depth details on output tokens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutputTokensDetails {
-    /// Reasoning tokens
-    pub reasoning_tokens: u64,
-}
-
-impl OutputTokensDetails {
-    pub(crate) fn new() -> Self {
-        Self {
-            reasoning_tokens: 0,
-        }
-    }
+    /// Reasoning tokens if reported; absence is distinct from zero.
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl Add for OutputTokensDetails {
     type Output = Self;
     fn add(self, rhs: Self) -> Self::Output {
         Self {
-            reasoning_tokens: self.reasoning_tokens + rhs.reasoning_tokens,
+            reasoning_tokens: self
+                .reasoning_tokens
+                .zip(rhs.reasoning_tokens)
+                .map(|(lhs, rhs)| lhs + rhs),
         }
     }
 }
@@ -1381,7 +1361,7 @@ where
                         usage
                             .input_tokens_details
                             .as_ref()
-                            .map(|d| d.cached_tokens)
+                            .and_then(|d| d.cached_tokens)
                             .unwrap_or(0),
                     );
                 }
@@ -1452,7 +1432,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 cached_input_tokens: usage
                     .input_tokens_details
                     .as_ref()
-                    .map(|d| d.cached_tokens)
+                    .and_then(|d| d.cached_tokens)
                     .unwrap_or(0),
                 cache_creation_input_tokens: 0,
             })

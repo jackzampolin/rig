@@ -12,11 +12,11 @@ use crate::completion::{CompletionError, CompletionRequest};
 use crate::http_client::HttpClientExt;
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::json_utils;
+use crate::providers::openai::responses_api::Output;
 use crate::providers::openai::responses_api::streaming::{
     ItemChunkKind, ResponseChunk, ResponseChunkKind, StreamingCompletionChunk,
     StreamingCompletionResponse, StreamingItemDoneOutput, reasoning_choices_from_done_item,
 };
-use crate::providers::openai::responses_api::{Output, ResponsesUsage};
 use crate::providers::xai::completion::{CompletionModel, XAICompletionRequest};
 use crate::streaming::{self, RawStreamingChoice};
 
@@ -91,7 +91,7 @@ where
 
     let stream = stream! {
         let span = tracing::Span::current();
-        let mut final_usage = ResponsesUsage::new();
+        let mut final_usage = None;
         let mut tool_call_internal_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
         while let Some(event_result) = event_source.next().await {
@@ -210,7 +210,7 @@ where
                             span.record("gen_ai.response.id", &response.id);
                             span.record("gen_ai.response.model", &response.model);
                             if let Some(usage) = response.usage {
-                                final_usage = usage;
+                                final_usage = Some(usage);
                             }
                     }
                 }
@@ -229,17 +229,12 @@ where
 
         event_source.close();
 
-        if !span.is_disabled() {
-            span.record("gen_ai.usage.input_tokens", final_usage.input_tokens);
-            span.record("gen_ai.usage.output_tokens", final_usage.output_tokens);
-            span.record(
-                "gen_ai.usage.cached_tokens",
-                final_usage
-                    .input_tokens_details
-                    .as_ref()
-                    .map(|d| d.cached_tokens)
-                    .unwrap_or(0),
-            );
+        if !span.is_disabled() && let Some(usage) = &final_usage {
+                span.record("gen_ai.usage.input_tokens", usage.input_tokens);
+                span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+                if let Some(cached) = usage.input_tokens_details.as_ref().and_then(|d| d.cached_tokens) {
+                    span.record("gen_ai.usage.cached_tokens", cached);
+                }
         }
 
         yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
@@ -259,6 +254,45 @@ mod tests {
     use crate::message::ReasoningContent;
     use crate::providers::openai::responses_api::ReasoningSummary;
     use crate::streaming::RawStreamingChoice;
+
+    #[tokio::test]
+    async fn missing_responses_usage_is_not_reported_as_zero() {
+        use crate::{
+            client::CompletionClient,
+            completion::{CompletionModel, GetTokenUsage},
+            http_client::mock::MockStreamingClient,
+            providers::xai,
+            streaming::StreamedAssistantContent,
+        };
+        use futures::StreamExt;
+        for kind in ["response.completed", "response.created"] {
+            let event = serde_json::json!({"type":kind,"sequence_number":1,"response":{
+                "id":"resp_test", "object":"response", "created_at":0, "status":"completed",
+                "model":"grok-test", "output":[], "tools":[]
+            }});
+            let client = xai::Client::builder()
+                .http_client(MockStreamingClient {
+                    sse_bytes: bytes::Bytes::from(format!("data: {event}\n\n")),
+                })
+                .api_key("test-key")
+                .build()
+                .unwrap();
+            let model = client.completion_model("grok-test");
+            let mut stream = model
+                .stream(model.completion_request("hello").build())
+                .await
+                .unwrap();
+            let mut saw_final = false;
+            while let Some(item) = stream.next().await {
+                if let StreamedAssistantContent::Final(response) = item.unwrap() {
+                    saw_final = true;
+                    assert!(response.usage.is_none(), "{kind}");
+                    assert!(response.token_usage().is_none());
+                }
+            }
+            assert!(saw_final);
+        }
+    }
 
     #[test]
     fn reasoning_done_item_emits_summary_then_encrypted() {
