@@ -848,12 +848,12 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             .as_ref()
             .map(|usage| completion::Usage {
                 input_tokens: usage.prompt_tokens as u64,
-                output_tokens: (usage.total_tokens - usage.prompt_tokens) as u64,
+                output_tokens: usage.output_tokens() as u64,
                 total_tokens: usage.total_tokens as u64,
                 cached_input_tokens: usage
                     .prompt_tokens_details
                     .as_ref()
-                    .map(|d| d.cached_tokens as u64)
+                    .and_then(|d| d.cached_tokens.map(|count| count as u64))
                     .unwrap_or(0),
                 cache_creation_input_tokens: 0,
             })
@@ -911,23 +911,53 @@ pub struct Choice {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct PromptTokensDetails {
-    /// Cached tokens from prompt caching
-    #[serde(default)]
-    pub cached_tokens: usize,
+    /// Cached prompt tokens; absence is distinct from a reported zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<usize>,
+}
+
+/// Provider-reported completion-token subdivisions.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CompletionTokensDetails {
+    /// Reasoning tokens are included in completion tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<usize>,
+    /// Generated audio tokens are included in completion tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_tokens: Option<usize>,
+    /// Accepted prediction tokens are included in completion tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_prediction_tokens: Option<usize>,
+    /// Rejected prediction tokens are included in completion tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_prediction_tokens: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
+    /// Output tokens reported by the provider, including reasoning tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<usize>,
+    /// Provider-reported output-token subdivisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
     pub total_tokens: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 impl Usage {
+    pub(crate) fn output_tokens(&self) -> usize {
+        self.completion_tokens
+            .unwrap_or_else(|| self.total_tokens.saturating_sub(self.prompt_tokens))
+    }
+
     pub fn new() -> Self {
         Self {
             prompt_tokens: 0,
+            completion_tokens: None,
+            completion_tokens_details: None,
             total_tokens: 0,
             prompt_tokens_details: None,
         }
@@ -958,12 +988,12 @@ impl GetTokenUsage for Usage {
     fn token_usage(&self) -> Option<crate::completion::Usage> {
         let mut usage = crate::completion::Usage::new();
         usage.input_tokens = self.prompt_tokens as u64;
-        usage.output_tokens = (self.total_tokens - self.prompt_tokens) as u64;
+        usage.output_tokens = self.output_tokens() as u64;
         usage.total_tokens = self.total_tokens as u64;
         usage.cached_input_tokens = self
             .prompt_tokens_details
             .as_ref()
-            .map(|d| d.cached_tokens as u64)
+            .and_then(|d| d.cached_tokens.map(|count| count as u64))
             .unwrap_or(0);
 
         Some(usage)
@@ -1740,5 +1770,52 @@ mod tests {
             tool_calls[0].function.arguments,
             serde_json::json!({"city": "Paris"})
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_observation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn usage_preserves_reported_components_and_zero_cache() {
+        let wire = json!({
+            "prompt_tokens":100, "completion_tokens":20, "total_tokens":999,
+            "prompt_tokens_details":{"cached_tokens":0},
+            "completion_tokens_details":{"reasoning_tokens":7}
+        });
+        let usage: Usage = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&usage).unwrap(), wire);
+        let common = usage.token_usage().unwrap();
+        assert_eq!(
+            (
+                common.input_tokens,
+                common.output_tokens,
+                common.total_tokens
+            ),
+            (100, 20, 999)
+        );
+    }
+
+    #[test]
+    fn omitted_components_are_not_serialized_as_reported_zero() {
+        let usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens":100, "total_tokens":100, "prompt_tokens_details":{}
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(&usage).unwrap();
+        assert!(wire.get("completion_tokens").is_none());
+        assert!(wire["prompt_tokens_details"].get("cached_tokens").is_none());
+        let response: super::streaming::StreamingCompletionResponse =
+            serde_json::from_value(json!({"usage":null})).unwrap();
+        assert!(response.token_usage().is_none());
+    }
+
+    #[test]
+    fn malformed_total_does_not_underflow_the_compatibility_projection() {
+        let usage: Usage =
+            serde_json::from_value(json!({"prompt_tokens":100,"total_tokens":1})).unwrap();
+        assert_eq!(usage.token_usage().unwrap().output_tokens, 0);
     }
 }

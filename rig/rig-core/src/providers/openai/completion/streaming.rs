@@ -71,21 +71,14 @@ struct StreamingCompletionChunk {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StreamingCompletionResponse {
-    pub usage: Usage,
+    /// The final provider usage event, absent when the stream reported none.
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> Option<crate::completion::Usage> {
-        let mut usage = crate::completion::Usage::new();
-        usage.input_tokens = self.usage.prompt_tokens as u64;
-        usage.output_tokens = self.usage.total_tokens as u64 - self.usage.prompt_tokens as u64;
-        usage.total_tokens = self.usage.total_tokens as u64;
-        usage.cached_input_tokens = self
-            .usage
-            .prompt_tokens_details
-            .as_ref()
-            .map_or(0, |d| d.cached_tokens as u64);
-        Some(usage)
+        self.usage.as_ref()?.token_usage()
     }
 }
 
@@ -322,16 +315,15 @@ where
             yield Ok(streaming::RawStreamingChoice::ToolCall(tool_call));
         }
 
-        let final_usage = final_usage.unwrap_or_default();
-        if !span.is_disabled() {
+        if let Some(final_usage) = final_usage.as_ref().filter(|_| !span.is_disabled()) {
             span.record("gen_ai.usage.input_tokens", final_usage.prompt_tokens);
-            span.record("gen_ai.usage.output_tokens", final_usage.total_tokens - final_usage.prompt_tokens);
+            span.record("gen_ai.usage.output_tokens", final_usage.output_tokens());
             span.record(
                 "gen_ai.usage.cached_tokens",
                 final_usage
                     .prompt_tokens_details
                     .as_ref()
-                    .map(|d| d.cached_tokens)
+                    .and_then(|d| d.cached_tokens)
                     .unwrap_or(0),
             );
         }
@@ -569,9 +561,37 @@ mod tests {
             }
         }
 
-        let usage = final_usage.expect("expected a final response with usage");
+        let usage = final_usage
+            .flatten()
+            .expect("expected a final response with usage");
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[tokio::test]
+    async fn stream_without_a_usage_chunk_does_not_report_zero_usage() {
+        use crate::http_client::mock::MockStreamingClient;
+        use bytes::Bytes;
+        use futures::StreamExt;
+
+        let client = MockStreamingClient { sse_bytes: Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\",\"tool_calls\":[]}}],\"usage\":null}\n\ndata: [DONE]\n\n") };
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .unwrap();
+        let mut stream = send_compatible_streaming_request(client, request)
+            .await
+            .unwrap();
+        let mut saw_final = false;
+        while let Some(chunk) = stream.next().await {
+            if let streaming::StreamedAssistantContent::Final(response) = chunk.unwrap() {
+                saw_final = true;
+                assert!(response.usage.is_none());
+                assert!(response.token_usage().is_none());
+            }
+        }
+        assert!(saw_final);
     }
 
     #[tokio::test]
@@ -614,11 +634,13 @@ mod tests {
         // Verify provider-level usage has the cached_tokens
         assert_eq!(
             res.usage
+                .as_ref()
+                .unwrap()
                 .prompt_tokens_details
                 .as_ref()
                 .unwrap()
                 .cached_tokens,
-            80
+            Some(80)
         );
 
         // Verify core Usage also has cached_input_tokens via GetTokenUsage

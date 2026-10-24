@@ -423,7 +423,7 @@ where
                                 usage
                                     .prompt_tokens_details
                                     .as_ref()
-                                    .map(|d| d.cached_tokens)
+                                    .and_then(|d| d.cached_tokens)
                                     .unwrap_or(0),
                             );
                         }
@@ -641,7 +641,8 @@ impl GetTokenUsage for StreamingCompletionResponse {
             .usage
             .prompt_tokens_details
             .as_ref()
-            .map(|d| d.cached_tokens as u64)
+            .and_then(|d| d.cached_tokens)
+            .map(|value| value as u64)
             .unwrap_or(0);
 
         Some(usage)
@@ -668,6 +669,7 @@ where
             prompt_tokens: 0,
             total_tokens: 0,
             prompt_tokens_details: None,
+            ..Usage::default()
         };
 
         let mut text_response = String::new();
@@ -803,7 +805,7 @@ where
             final_usage
                 .prompt_tokens_details
                 .as_ref()
-                .map(|d| d.cached_tokens)
+                .and_then(|d| d.cached_tokens)
                 .unwrap_or(0),
         );
 

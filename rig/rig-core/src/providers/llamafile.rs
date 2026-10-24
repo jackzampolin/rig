@@ -431,6 +431,7 @@ where
             prompt_tokens: 0,
             total_tokens: 0,
             prompt_tokens_details: None,
+            ..Default::default()
         };
         let mut text_response = String::new();
         let mut calls: HashMap<usize, (String, String, String)> = HashMap::new();

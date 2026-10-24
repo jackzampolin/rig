@@ -19,17 +19,26 @@ use crate::streaming;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct StreamingCompletionResponse {
-    pub usage: Usage,
+    /// The provider's usage event, absent when no usage was reported.
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> Option<crate::completion::Usage> {
+        let observed = self.usage.as_ref()?;
         let mut usage = crate::completion::Usage::new();
-
-        usage.input_tokens = self.usage.prompt_tokens as u64;
-        usage.output_tokens = self.usage.completion_tokens as u64;
-        usage.total_tokens = self.usage.total_tokens as u64;
-
+        usage.input_tokens = observed.prompt_tokens as u64;
+        usage.output_tokens = observed
+            .completion_tokens
+            .unwrap_or_else(|| observed.total_tokens.saturating_sub(observed.prompt_tokens))
+            as u64;
+        usage.total_tokens = observed.total_tokens as u64;
+        usage.cached_input_tokens = observed
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+            .unwrap_or_default() as u64;
         Some(usage)
     }
 }
@@ -74,7 +83,16 @@ struct StreamingToolCall {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Usage {
     pub prompt_tokens: u32,
-    pub completion_tokens: u32,
+    /// Provider-reported output tokens; absence is distinct from zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    /// Provider-reported prompt cache usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<crate::providers::openai::completion::PromptTokensDetails>,
+    /// Provider-reported completion subdivisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details:
+        Option<crate::providers::openai::completion::CompletionTokensDetails>,
     pub total_tokens: u32,
 }
 
@@ -323,7 +341,7 @@ where
 
         // Final response with usage
         yield Ok(streaming::RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-            usage: final_usage.unwrap_or_default(),
+            usage: final_usage,
         }));
     }.instrument(span);
 
@@ -444,7 +462,7 @@ mod tests {
         assert!(response.usage.is_some());
         let usage = response.usage.unwrap();
         assert_eq!(usage.prompt_tokens, 100);
-        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.completion_tokens, Some(50));
         assert_eq!(usage.total_tokens, 150);
     }
 
